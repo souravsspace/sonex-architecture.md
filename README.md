@@ -1,0 +1,1 @@
+# sonex-architecture.md
