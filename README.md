@@ -76,8 +76,10 @@ graph TB
         APIS["api service<br/>Hono on Bun"]
         WRK["worker service<br/>BullMQ consumer"]
         PRG["purge cron<br/>daily 03:00"]
-        PG[("Postgres<br/>31 tables")]
+        BKP["backup cron<br/>daily 02:00"]
+        PG[("Postgres<br/>33 tables")]
         RD[("Redis<br/>cache · counters · queue")]
+        BUK[("Railway Bucket<br/>sonex-backups")]
     end
 
     subgraph ext["Third parties"]
@@ -85,6 +87,7 @@ graph TB
         PL["Polar<br/>subscriptions + usage meter"]
         ST["Stripe / Polar<br/>customer revenue read"]
         GEO["GeoLite2 mmdb<br/>baked into the image"]
+        SEN["Sentry<br/>errors · EU region"]
     end
 
     V -->|"POST /api/send · /api/batch"| APIS
@@ -108,6 +111,10 @@ graph TB
     RD --> WRK
     WRK --> PG
     PRG --> PG
+    BKP -->|"pg_dump"| PG
+    BKP -->|"nightly dump object"| BUK
+    APIS -->|"unhandled errors"| SEN
+    WEB -->|"unhandled errors"| SEN
 ```
 
 Two things worth calling out because they are non-obvious:
@@ -257,7 +264,7 @@ request each time and simply stops being derivable once the salt rotates.
 | Mechanism | Default | Trade |
 | --- | --- | --- |
 | `directSink` | on | One INSERT per event, committed before the ack. A `200` means durable. |
-| `createBufferedSink` | `INGEST_BUFFER` | Multi-row INSERT every 1 s / 500 rows. A hard crash loses at most one batch. |
+| `createBufferedSink` | `INGEST_BUFFER` | Multi-row INSERT every 1 s / 500 rows. **Any** drain failure — not just a hard crash — discards up to 500 rows, with no log line and no drop counter. Off in production. |
 | `usage-buffer` | on | Billing counters coalesced in memory, flushed periodically. |
 
 Both buffers are drained by the `SIGTERM` / `SIGINT` hook in `create-app.ts`. Without it,
@@ -358,8 +365,8 @@ dashboard and `/api/v2/query` surfaces which expand them.
 
 ## 6. Data model
 
-31 tables, all defined in `packages/db/src/schema/`, migrated with drizzle-kit
-(`0000` → `0015`) and applied on deploy.
+33 tables, all defined in `packages/db/src/schema/`, migrated with drizzle-kit
+(`0000` → `0018`) and applied on deploy.
 
 ```mermaid
 erDiagram
@@ -400,7 +407,8 @@ erDiagram
 | Analytics (high write) | `session` `website_event` `session_stats` `event_data` `session_data` | The hot tables. No foreign keys — see below. `session` inserts use `onConflictDoNothing(session_id)`. |
 | Websites & config | `website` `website_hostname` `website_shield` `segment` `annotation` `revenue` `website_integration` `report` | `website_integration` stores provider credentials AES-GCM encrypted. |
 | Identity | `user` `auth_session` `account` `verification` `organization` `member` `invitation` | better-auth owns the shape; the org plugin is the canonical team model. |
-| Billing | `subscription` `usage_counter` | `usage_counter` is incremented atomically under an advisory lock. |
+| Billing | `subscription` `usage_counter` `subscription_event` | `usage_counter` is incremented atomically under an advisory lock. `subscription` is the current-state projection; `subscription_event` is the append-only history behind it. |
+| Compliance | `audit_log` | Append-only record of who did what. Never updated except to pseudonymize an erased actor. |
 | Entities | `board` `share` `link` `pixel` | |
 | Imports | `site_import` `imported_stats` | Checkpointed by dataset so a run resumes. |
 | Replay | `session_replay` `session_replay_saved` | Schema present; feature not shipped in the UI. |
@@ -411,10 +419,13 @@ membership/roles live in the plugin's `member` table — there is no separate te
 **The five hot tables declare no foreign keys.** Everywhere else — auth, organizations,
 imports — uses real constraints with `ON DELETE CASCADE`. On the write path the reference
 is a plain `uuid`, because every insert would otherwise pay for a constraint check, and the
-tables already carry roughly ten indexes each: one `(website_id, created_at, X)` btree per
-filterable dimension (browser, os, device, country, city, url path, referrer domain, event
-name…). The cost is that deletion is **application-enforced** — a hand-rolled, ordered
-sequence of `DELETE`s inside one transaction. A new hot table inherits that
+tables already carry a heavy index load — 14 on `website_event`, 11 on `session`, 6 on
+`session_data`, 5 on `event_data`: one `(website_id, created_at, X)` btree per filterable
+dimension (browser, os, device, country, city, url path, referrer domain, event name…).
+That count is the write-amplification budget, and so the number that decides when Postgres
+stops being enough. The cost of dropping the FKs is that deletion is
+**application-enforced** — a hand-rolled,
+ordered sequence of `DELETE`s inside one transaction. A new hot table inherits that
 obligation; a new config table should use a real FK.
 
 **`website_event` is polymorphic.** One `event_type` discriminator covers six kinds of
@@ -558,9 +569,14 @@ read clamps its date range to that pointer. Moving it — a GDPR erasure, a manu
 makes data unreadable instantly, while the physical `DELETE` waits for the next nightly
 run. "Unreadable" and "deleted" are allowed to disagree in between, on purpose.
 
+That second clock is the *manual* one only. `reset_at` is written in exactly one place,
+`resetWebsite`; `runPurge` never advances it. Tier retention therefore has no read-side
+clock — data past a plan's window stays readable until the physical delete removes it.
+
 The purge works on the raw tables: `event_data`, `session_data`, `website_event`,
-`session_replay` and `session`. The `session_stats` rollup is not one of them, so
-visit-level aggregates are retained past the window that governs the rows beneath them.
+`session_replay` and `session` (`lib/billing/retention.ts` · `PURGE_TABLES`).
+`session_stats` is not one of them, and no other path deletes it either — it is currently
+written by every visit and removed by nothing.
 
 ### Ingest trust boundary
 
@@ -586,8 +602,29 @@ in two shapes: schema validation fails as `422` with the Zod issues, everything 
 response — the stack goes to stderr under the same request id, and the caller gets the id
 to quote.
 
-Observability stops there: JSON on stdout, correlated by request id. No APM, no metrics
-exporter, no error-tracking SaaS.
+Every log line carries `message` and `level`, because that pair is what a log platform
+renders and colours a JSON line by. Without them the object is captured but shows up blank,
+and every other field on it is invisible — which is how a production `xffHops` measurement
+was once lost. Railway retains those lines for its plan's window (7 d Hobby, 30 d Pro,
+90 d Enterprise); anything longer needs a drain to a third-party sink.
+
+### Error tracking
+
+Unhandled errors are reported to **Sentry** — the API's `onError` middleware, the import
+worker's `failed` handler, the retention cron's top-level catch, and the dashboard's
+`DefaultCatchBoundary`. Handled `HTTPException`s are deliberately not reported: a 4xx is an
+answer, not a defect, and would bury the real ones.
+
+It is opt-in on a DSN (`SENTRY_DSN` server-side, `VITE_SENTRY_DSN` in the browser bundle).
+With none set the SDK is never initialised, so dev, CI and the test suite send nothing.
+
+The privacy posture is explicit rather than inherited. The SDK's defaults collect cookies,
+request and response headers, bodies, URL query strings, database query data and local
+stack variables; **every one of those categories is denied** in `lib/sentry.ts` on both
+sides, tracing is off, and the browser SDK registers no integrations at all — notably no
+session replay, which would record a customer's dashboard and with it their visitors' data
+inside a product sold on not collecting it. What leaves the process is the exception type,
+the message, the stack, and identifier-only tags (request id, method, path, route, scope).
 
 The OpenAPI document at `/doc` and the Scalar UI at `/reference` are gated behind
 `DOCS_ENABLED`, off by default, because `/doc` enumerates every route and schema in the
@@ -598,8 +635,9 @@ same Zod schema `/api/v2/query` validates against, served so clients can't drift
 
 ## 8. Background work and the data lifecycle
 
-Three things happen outside a request: imports, the retention purge, and deletion. Each
-runs in its own Railway service, and their restart policies are the contract.
+Four things happen outside a request: imports, the retention purge, the nightly database
+backup, and deletion. Each runs in its own Railway service, and their restart policies are
+the contract.
 
 ```mermaid
 flowchart LR
@@ -608,6 +646,7 @@ flowchart LR
     Q --> W["worker<br/>concurrency 1"]
     W -->|"per-dataset checkpoint"| PG2[("site_import<br/>imported_stats")]
     CRON["purge cron<br/>03:00, restart NEVER"] --> PG2
+    BAK["backup cron<br/>02:00, restart NEVER"] -->|"pg_dump stream"| S3[("Railway Bucket<br/>sonex-backups")]
     DEL["account / website<br/>deletion"] -->|"one transaction"| PG2
 ```
 
@@ -631,10 +670,30 @@ The self-hosted stack has no scheduler, so there the same script runs as a `slee
 loop — it fires on container start rather than at 03:00, which is a genuinely different
 retention timing between the two deploy targets.
 
-**Deletion is hard, with one deliberate exception.** GDPR account deletion walks every
-user-keyed table explicitly inside one transaction — the hot tables have no cascade to
+**The backup cron writes outward, not inward.** At 02:00 UTC it streams `pg_dump --format=custom`
+straight into a Railway Bucket rather than staging a file on disk, so the container needs no
+volume and the dump size is bounded by the database, not by the service. It prunes objects
+past the retention window in the same run, and it is the only background job whose failure is
+worth waking up for — see [`BACKUP.md`](./BACKUP.md) for the schedule, the restore procedure
+and the measured RPO/RTO. Its restart policy is `NEVER`, for the same reason the purge's is.
+
+**Deletion is hard, with two deliberate exceptions.** GDPR account deletion walks the
+user-keyed tables explicitly inside one transaction — the hot tables have no cascade to
 lean on — and takes the encrypted `website_integration` credentials with it, since payment
-credentials must not survive an erasure. Deleting a *website* hard-deletes all its
+credentials must not survive an erasure. Because the coverage is written by hand rather
+than declared by the schema, `deletion-coverage.test.ts` reflects over every table carrying
+a `website_id` and fails the build if any of them is absent from a deletion path — it is
+what stops a new table from being quietly forgotten here.
+
+Two rows are deliberately kept, and both are compliance decisions rather than oversights.
+`subscription_event` survives: it is the append-only billing history an auditor reads, it
+holds no personal data, and once the transaction commits its `account_id` resolves to
+nobody. `audit_log` survives **pseudonymized** — the actor link is cut and the email
+snapshot is replaced by an irreversible keyed digest, so entries stay correlatable to one
+another while identifying no one. That is how an append-only trail and a right to erasure
+coexist; deleting the trail instead would satisfy neither.
+
+Deleting a *website* hard-deletes all its
 analytics rows but soft-deletes the `website`, `link` and `pixel` rows themselves, so
 slugs stay claimed and cannot be silently re-pointed at another site.
 
@@ -717,7 +776,7 @@ flowchart LR
     EL --> GATE
     GATE -->|yes| DW["deploy-web<br/>CF Pages"]
     GATE -->|yes| DM["deploy-marketing<br/>CF Pages"]
-    GATE -->|yes| DR["deploy-railway<br/>matrix: api · worker · purge"]
+    GATE -->|yes| DR["deploy-railway<br/>matrix: api · worker · purge · backup"]
     DR --> MIG["db:migrate:deploy<br/>on release"]
 ```
 
@@ -772,3 +831,4 @@ For anything finer-grained, use the knowledge graph instead of grepping:
 /graphify explain "assertCanViewWebsite"
 /graphify packages --update      # rebuild after non-trivial changes
 ```
+
