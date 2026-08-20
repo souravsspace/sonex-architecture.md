@@ -610,10 +610,27 @@ was once lost. Railway retains those lines for its plan's window (7 d Hobby, 30 
 
 ### Error tracking
 
-Unhandled errors are reported to **Sentry** — the API's `onError` middleware, the import
-worker's `failed` handler, the retention cron's top-level catch, and the dashboard's
-`DefaultCatchBoundary`. Handled `HTTPException`s are deliberately not reported: a 4xx is an
-answer, not a defect, and would bury the real ones.
+Errors are reported to **Sentry**, at four severities that exist so the signal stays
+readable:
+
+| Kind | What it is | Where |
+| --- | --- | --- |
+| **Error** | A defect: an unhandled request failure, a silent swallow that loses data or money, a job that could not finish | `onError`, the import worker's `failed` and `error` handlers, both crons' top-level catches, ~19 previously-silent `catch` blocks in the API, and on the client every failed mutation plus any read that is not a deliberate 4xx |
+| **Warning** | A degraded path that recovered: an unparseable address, an expired share token, a mangled URL component, a mis-configured ignore range | The input-parsing helpers on the ingest path |
+| **Log** | One structured line per failure — a 5xx request, a cron waiting on a sleeping database | `middlewares/logger.ts` and the crons. Only `warn`/`error`/`fatal` are forwarded; an info line per request would be quota with no diagnostic value |
+| **Check-in** | A cron that fired, finished, and how long it took | The nightly backup (`0 2 * * *`) and the retention purge (`0 3 * * *`) |
+
+Handled `HTTPException`s are deliberately **not** reported: a 4xx is an answer, not a
+defect, and would bury the real ones. The same rule shapes the client — a 401 (expired
+session) or 403 (a panel behind a higher tier) on a read is the product working.
+
+Check-ins are the one report that fires when *nothing* happens. A cron that stops running
+throws no error at all, so without them a backup that quietly died is discovered at the
+moment it is needed.
+
+Repeats are rate-limited per call site, not per severity: a Redis outage on the per-event
+metering path would otherwise file one event per request for the length of the outage. Each
+distinct call site reports at most once a minute.
 
 It is opt-in on a DSN (`SENTRY_DSN` server-side, `VITE_SENTRY_DSN` in the browser bundle).
 With none set the SDK is never initialised, so dev, CI and the test suite send nothing.
@@ -621,10 +638,21 @@ With none set the SDK is never initialised, so dev, CI and the test suite send n
 The privacy posture is explicit rather than inherited. The SDK's defaults collect cookies,
 request and response headers, bodies, URL query strings, database query data and local
 stack variables; **every one of those categories is denied** in `lib/sentry.ts` on both
-sides, tracing is off, and the browser SDK registers no integrations at all — notably no
-session replay, which would record a customer's dashboard and with it their visitors' data
-inside a product sold on not collecting it. What leaves the process is the exception type,
-the message, the stack, and identifier-only tags (request id, method, path, route, scope).
+sides, and tracing is off. No client IP is ever sent — the address that failed to parse is
+precisely the value these reports refuse to carry, so the failure mode travels and the
+address does not. A signed-in account is identified by its **opaque user id only**, never
+its email.
+
+The browser SDK keeps Sentry's *default* integrations, which is what reports an uncaught
+error or an unhandled rejection at all. **Session replay is not among them** and must never
+be added: it would record a customer's dashboard, and with it their visitors' data, inside
+a product sold on not collecting it. What leaves the process is the exception type, the
+message, the stack, and identifier-only tags (request id, method, path, route, scope,
+status, user id).
+
+Browser stack traces resolve through source maps uploaded at build time when CI supplies
+`SENTRY_AUTH_TOKEN`. The maps are emitted `hidden` and deleted once uploaded, so none of
+them ever reaches Cloudflare Pages.
 
 The OpenAPI document at `/doc` and the Scalar UI at `/reference` are gated behind
 `DOCS_ENABLED`, off by default, because `/doc` enumerates every route and schema in the
